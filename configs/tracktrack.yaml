@@ -6,7 +6,7 @@
 # Docs: https://docs.ultralytics.com/modes/track
 
 tracker_type: tracktrack # (str) Tracker backend: tracktrack
-track_high_thresh: 1 # (float) High-confidence detection threshold
+track_high_thresh: 0.75 # (float) High-confidence detection threshold
 track_low_thresh: 0.25 # (float) Low-confidence detection threshold for second stage
 new_track_thresh: 0.7 # (float) Minimum score to start a new track via track-aware initialization (TAI)
 track_buffer: 30 # (int) Frames to keep lost tracks alive
