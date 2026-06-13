@@ -3,3 +3,5 @@ numpy
 ultralytics
 torch
 torchvision
+sahi
+boxmot
