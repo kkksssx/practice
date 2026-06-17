@@ -7,6 +7,7 @@ import queue
 from sahi import AutoDetectionModel
 from sahi.predict import get_sliced_prediction
 from boxmot.trackers.ocsort.ocsort import OcSort
+import sys
 
 # TRACKER_CONFIG = "bytetrack.yaml"
 # TRACKER_CONFIG = "botsort.yaml"
@@ -252,8 +253,8 @@ def main():
 
     print(f"Частота кадров видео: {video_fps} FPS")
 
-    capture_thread = threading.Thread(target=capture_thread_func, args=(VIDEO_PATH,))
-    process_thread = threading.Thread(target=process_thread_func, args=())
+    capture_thread = threading.Thread(target=capture_thread_func, args=(VIDEO_PATH,), daemon=True)
+    process_thread = threading.Thread(target=process_thread_func, args=(), daemon=True)
 
     capture_thread.start()
     process_thread.start()
@@ -261,7 +262,7 @@ def main():
 
     fourcc = cv2.VideoWriter.fourcc(*'XVID')
     out = cv2.VideoWriter(
-        "output_track.mp4",
+        "output_track.avi",
         fourcc,
         video_fps,
         DSIZE
@@ -290,9 +291,15 @@ def main():
         except queue.Empty:
              pass
 
-        if cv2.waitKey(1) & 0xFF == ord('q'):
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
+            print("\n Прервано пользователем (нажата 'q')")
             running = False
-            break
+            if out is not None:
+                out.release()
+                print(f"Видео сохранено: output_track.avi ({frame_count} кадров)")
+            cv2.destroyAllWindows()
+            sys.exit(0)
 
     print("Ожидание завершения потоков...")
     running = False
