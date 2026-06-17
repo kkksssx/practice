@@ -41,7 +41,7 @@ frame_queue = queue.Queue(maxsize=QUEUE_SIZE)
 result_queue = queue.Queue(maxsize=QUEUE_SIZE)
 running = True
 
-model_path = "yolov8s.pt"
+model_path = "yolov8s_openvino_model/"
 model = YOLO(model_path)
 
 # SAHI модель для детекции
