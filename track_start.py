@@ -6,21 +6,30 @@ import threading
 import queue
 from sahi import AutoDetectionModel
 from sahi.predict import get_sliced_prediction
-from boxmot.trackers.bytetrack.bytetrack import ByteTrack
+from boxmot.trackers.ocsort.ocsort import OcSort
 
 # TRACKER_CONFIG = "bytetrack.yaml"
 # TRACKER_CONFIG = "botsort.yaml"
 # TRACKER_CONFIG = "ocsort.yaml"
 #TRACKER_CONFIG = "tracktrack.yaml"
 
-QUEUE_SIZE = 30
+#минимальные размеры для фильтрации ложных срабатываний
+MIN_BOX_WIDTH = 20      #мин ширина бокса в пикселях
+MIN_BOX_HEIGHT = 35     #мин высота бокса в пикселях
+MIN_BOX_AREA = 700      #мин площадь бокса
+MAX_BOX_AREA = 200000
+MIN_ASPECT_RATIO = 0.25
+MAX_ASPECT_RATIO = 1.2
+MIN_CONFIDENCE = 0.25
+
+QUEUE_SIZE = 0
 DETECTION_INTERVAL = 5
 DSIZE=(1280,720)
 VIDEO_PATH = "md1.mp4"
 
-SLICE_HEIGHT = 640      # Высота каждого куска (тайла)
-SLICE_WIDTH = 640       # Ширина каждого куска
-OVERLAP_RATIO = 0.3     # Перекрытие между кусками (20%)
+SLICE_HEIGHT = 480      # Высота каждого куска (тайла)
+SLICE_WIDTH = 480      # Ширина каждого куска
+OVERLAP_RATIO = 0.25     # Перекрытие между кусками
 
 CONFIDENCE_THRESHOLD = 0.25 # уверенность(умен, если не находит)
 
@@ -31,7 +40,7 @@ frame_queue = queue.Queue(maxsize=QUEUE_SIZE)
 result_queue = queue.Queue(maxsize=QUEUE_SIZE)
 running = True
 
-model_path = "yolov8n.pt"
+model_path = "yolov8s.pt"
 model = YOLO(model_path)
 
 # SAHI модель для детекции
@@ -43,18 +52,34 @@ sahi_model = AutoDetectionModel.from_pretrained(
 )
 
 # BoxMOT трекер
-tracker = ByteTrack(
+tracker = OcSort(
     det_thresh=0.1,      # Порог уверенности для детекций
-    max_age=30,           # Максимальный возраст трека в кадрах
+    max_age=20,           # Максимальный возраст трека в кадрах
     min_hits=1,           # Минимум детекций для подтверждения трека
     iou_threshold=0.3,    # Порог IoU для связывания
-    track_thresh=0.1,     # Порог для уверенных треков
-    match_thresh=0.8,     # Порог для сопоставления
-    track_buffer=30,      # Буфер для потерянных треков
-    frame_rate=6          # Частота кадров 30 FPS видео / 5 (интервал детекции) = 6 FPS для трекера
+    obs_thresh=0.5,       # Порог уверенности для наблюдения
+    #track_thresh=0.1,     # Порог для уверенных треков
+    #match_thresh=0.8,     # Порог для сопоставления
+    #track_buffer=30,      # Буфер для потерянных треков
+    #frame_rate=6          # Частота кадров 30 FPS видео / 5 (интервал детекции) = 6 FPS для трекера
 )
 
 video_path = "md1.mp4"
+
+#повышение контраста и резкости кадра
+def enhance_frame(frame):
+    lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    cl = clahe.apply(l)
+    enhanced = cv2.merge((cl, a, b))
+    enhanced = cv2.cvtColor(enhanced, cv2.COLOR_LAB2BGR)
+
+    gaussing = cv2.GaussianBlur(enhanced, (0,0), 2)
+    sharpened = cv2.addWeighted(enhanced, 1.3, gaussing, -0.3, 0)
+
+    return sharpened
+
 
 #1поток:заъват кадров
 def capture_thread_func(path):
@@ -70,6 +95,8 @@ def capture_thread_func(path):
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))  # ширина кадра в пикселях
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))  # высота кадра
    '''
+    video_fps = int(cap.get(cv2.CAP_PROP_FPS))
+    print(f"Исходная частота кадров видео: {video_fps} FPS")
 
     local_frame_counter = 0
 
@@ -84,14 +111,7 @@ def capture_thread_func(path):
 
         frame = cv2.resize(src=frame, dsize=DSIZE, interpolation=cv2.INTER_NEAREST)
 
-        try:
-            frame_queue.put((local_frame_counter, frame), timeout=0.1)
-        except queue.Full:
-            try:
-                frame_queue.get_nowait()
-                frame_queue.put((local_frame_counter, frame), timeout=0.1)
-            except queue.Empty:
-                pass
+        frame_queue.put((local_frame_counter, frame))
 
     cap.release()
     frame_queue.put(None)
@@ -101,7 +121,7 @@ def capture_thread_func(path):
 def process_thread_func():
     global running, track_history, model, out
     process_counter = 0
-
+    processed_counter = 0
     last_tracks = [] #сохранение последних известных треков для отрисовки на промежуточных кадрах
 
     while running:
@@ -112,20 +132,15 @@ def process_thread_func():
 
         frame_idx, frame = item
         process_counter += 1
+        processed_counter += 1
 
         if process_counter % DETECTION_INTERVAL == 1:
+
+            enhanced_frame = enhance_frame(frame)
              #трекинг на текущем кадре, с сохранением треков между кадрами
-            '''
-            results = model.track(
-                    frame,
-                    persist=True,
-                    conf=0.3,
-                    iou=0.5,
-                    verbose=False)
-            #tracker=TRACKER_CONFIG)
-            '''
+
             result = get_sliced_prediction(
-                frame,
+                enhanced_frame,
                 sahi_model,
                 slice_height=SLICE_HEIGHT,
                 slice_width=SLICE_WIDTH,
@@ -140,6 +155,22 @@ def process_thread_func():
             for obj in result.object_prediction_list:
                 if obj.category.name == 'person':
                     bbox = obj.bbox.to_xyxy()
+                    x1, y1, x2, y2 = bbox[0], bbox[1], bbox[2], bbox[3]
+
+                    width = x2 - x1
+                    height = y2 - y1
+                    area = width * height
+                    aspect_ratio = width / max(height, 1)
+
+                    if width < MIN_BOX_WIDTH or height < MIN_BOX_HEIGHT:
+                        continue
+                    if area < MIN_BOX_AREA or area > MAX_BOX_AREA:
+                        continue
+                    if aspect_ratio < MIN_ASPECT_RATIO or aspect_ratio > MAX_ASPECT_RATIO:
+                        continue
+                    if obj.score.value < MIN_CONFIDENCE:
+                        continue
+
                     detections.append([
                          bbox[0], bbox[1], bbox[2], bbox[3],
                          obj.score.value,
@@ -166,7 +197,12 @@ def process_thread_func():
 
         else:
             #просто использует сохраненные треки, чтобы они не исчезали
-            tracks = last_tracks
+            tracks = tracker.update(np.empty((0, 6)), frame)
+
+            if len(tracks) == 0 and len(last_tracks) > 0:
+                tracks = last_tracks
+            else:
+                last_tracks = tracks
 
 
         annotated_frame = frame.copy()
@@ -210,6 +246,12 @@ def main():
     global running, out, DSIZE
     #video_path = "md1.mp4"
 
+    temp_cap = cv2.VideoCapture(VIDEO_PATH)
+    video_fps = int(temp_cap.get(cv2.CAP_PROP_FPS))
+    temp_cap.release()
+
+    print(f"Частота кадров видео: {video_fps} FPS")
+
     capture_thread = threading.Thread(target=capture_thread_func, args=(VIDEO_PATH,))
     process_thread = threading.Thread(target=process_thread_func, args=())
 
@@ -217,34 +259,20 @@ def main():
     process_thread.start()
 
 
-    fourcc = cv2.VideoWriter.fourcc(*'mp4v')
+    fourcc = cv2.VideoWriter.fourcc(*'XVID')
     out = cv2.VideoWriter(
         "output_track.mp4",
         fourcc,
-        30,
+        video_fps,
         DSIZE
     )
 
-    '''
-    while cap.isOpened():
-        success, frame = cap.read()  # считывает кадр из видео
-        if not success:
-            print("конец видео")
-            break
-
-        
-            results = model.track(source="path/to/video.mp4", tracker="bytetrack.yaml")
-            results = model.track(source="path/to/video.mp4", tracker="ocsort.yaml")
-            results = model.track(source="path/to/video.mp4", tracker="tracktrack.yaml")
-            
-            results = model.track(frame, persist=True, conf=0.3, iou=0.5, tracker="bytetrack.yaml")
-            '''
     print("Начинаем отображение...")
     frame_count = 0
 
     while running:
         try:
-            frame = result_queue.get(timeout=1)
+            frame = result_queue.get(timeout=0.1)
 
             if frame is None:
                 print("Получен сигнал завершения")
@@ -258,26 +286,26 @@ def main():
                 if out is not None:
                     out.write(frame)
 
-            else:
-                print(f"ПРЕДУПРЕЖДЕНИЕ: получен не кадр, а {type(frame)}")
-                continue
-
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                running = False
-                break
 
         except queue.Empty:
-            continue
-        except Exception as e:
-            print(f"Ошибка: {e}")
-            continue
+             pass
 
-    if out is not None:
-        out.release()
-    cv2.destroyAllWindows()
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            running = False
+            break
+
+    print("Ожидание завершения потоков...")
+    running = False
 
     capture_thread.join()
     process_thread.join()
+
+    if out is not None:
+        out.release()
+        print(f"Видео сохранено: output_track.mp4 ({frame_count} кадров)")
+
+    cv2.destroyAllWindows()
+    print("Готово!")
 
 if __name__ == "__main__":
     main()
