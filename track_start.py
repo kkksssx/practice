@@ -8,6 +8,14 @@ from sahi import AutoDetectionModel
 from sahi.predict import get_sliced_prediction
 from boxmot.trackers.ocsort.ocsort import OcSort
 import sys
+from heatmap import (
+    HeatmapGenerator,
+    PerspectiveTransformer,
+    create_default_transformer,
+    create_heatmap_overlay,
+    draw_heatmap_legend
+)
+import imageio
 
 # TRACKER_CONFIG = "bytetrack.yaml"
 # TRACKER_CONFIG = "botsort.yaml"
@@ -33,6 +41,11 @@ SLICE_WIDTH = 480      # Ширина каждого куска
 OVERLAP_RATIO = 0.25     # Перекрытие между кусками
 
 CONFIDENCE_THRESHOLD = 0.25 # уверенность(умен, если не находит)
+
+HEATMAP_WIDTH = 640
+HEATMAP_HEIGHT = 480
+HEATMAP_DECAY = 0.95
+HEATMAP_RADIUS = 15
 
 track_history = defaultdict(lambda: [])
 out=None
@@ -125,8 +138,20 @@ def process_thread_func():
     processed_counter = 0
     last_tracks = [] #сохранение последних известных треков для отрисовки на промежуточных кадрах
 
+    heatmap_gen = HeatmapGenerator(
+        HEATMAP_WIDTH, HEATMAP_HEIGHT,
+        decay=HEATMAP_DECAY,
+        radius=HEATMAP_RADIUS
+    )
+
+    transformer = None
+
     while running:
-        item = frame_queue.get()
+        try:
+            item = frame_queue.get(timeout=0.5)
+        except queue.Empty:
+            continue
+
         if item is None:
             result_queue.put(None)
             break
@@ -134,6 +159,12 @@ def process_thread_func():
         frame_idx, frame = item
         process_counter += 1
         processed_counter += 1
+        if not running:
+            break
+
+        if transformer is None:
+            transformer = create_default_transformer(frame.shape, HEATMAP_WIDTH, HEATMAP_HEIGHT)
+            print("Perspective transformer initialized")
 
         if process_counter % DETECTION_INTERVAL == 1:
 
@@ -207,6 +238,16 @@ def process_thread_func():
 
 
         annotated_frame = frame.copy()
+
+        heatmap_view = create_heatmap_overlay(
+            heatmap_gen, transformer, tracks, track_history,
+            frame.shape, (HEATMAP_WIDTH, HEATMAP_HEIGHT)
+        )
+
+        cv2.putText(heatmap_view, "HEATMAP - TOP VIEW", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        cv2.putText(heatmap_view, f"Tracks: {len(tracks)}", (10, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
             #persons_found = 0
 
         if len(tracks) > 0:
@@ -231,20 +272,38 @@ def process_thread_func():
                                   color=(230, 230, 230), thickness=3)
 
         if process_counter % DETECTION_INTERVAL == 1:
-            cv2.putText(annotated_frame, f"DETECTION FRAME (SAHI)",
+            cv2.putText(annotated_frame, f"DETECTION (OpenVINO)",
                         (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         else:
-            cv2.putText(annotated_frame, f"TRACKING ONLY",
+            cv2.putText(annotated_frame, f"TRACKING",
                         (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
         cv2.putText(annotated_frame, f"Frame: {frame_idx}",
                         (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
-        result_queue.put(annotated_frame)
+        # + легенду heatmap
+        draw_heatmap_legend(annotated_frame, position=(10, DSIZE[1] - 60))
+
+        #объединение кадров
+        heatmap_resized = cv2.resize(heatmap_view, (DSIZE[0] // 2, DSIZE[1] // 2))
+
+        combined_frame = np.zeros((DSIZE[1], DSIZE[0] + DSIZE[0] // 2, 3), dtype=np.uint8)
+        combined_frame[:DSIZE[1], :DSIZE[0]] = annotated_frame
+
+        h_heat, w_heat = heatmap_resized.shape[:2]
+        combined_frame[:h_heat, DSIZE[0]:DSIZE[0] + w_heat] = heatmap_resized
+
+        cv2.putText(combined_frame, "Main View", (10, DSIZE[1] - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        cv2.putText(combined_frame, "Heatmap View", (DSIZE[0] + 10, DSIZE[1] - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+        if running:
+            result_queue.put(combined_frame)
 
 
 def main():
-    global running, out, DSIZE
+    global running, DSIZE
     #video_path = "md1.mp4"
 
     temp_cap = cv2.VideoCapture(VIDEO_PATH)
@@ -259,60 +318,111 @@ def main():
     capture_thread.start()
     process_thread.start()
 
+    combined_width = DSIZE[0] + DSIZE[0] // 2
+    combined_height = DSIZE[1]
 
-    fourcc = cv2.VideoWriter.fourcc(*'XVID')
-    out = cv2.VideoWriter(
-        "output_track.avi",
-        fourcc,
-        video_fps,
-        DSIZE
-    )
+    try:
+        writer = imageio.get_writer(
+            "output_track.mp4",
+            fps=video_fps,
+            codec='libx264',
+            quality=8,
+            macro_block_size=None
+        )
+        print("imageio writer открыт успешно")
+
+    except Exception as e:
+        print(f"ERROR: Не удалось создать writer: {e}")
+        print("Установи: pip install imageio imageio-ffmpeg")
+        running = False
+        # Потоки daemon=True, завершатся сами
+        return
 
     print("Начинаем отображение...")
     frame_count = 0
 
-    while running:
-        try:
-            frame = result_queue.get(timeout=0.1)
+    try:
 
-            if frame is None:
-                print("Получен сигнал завершения")
+        while running:
+            try:
+                frame = result_queue.get(timeout=0.1)
+
+                if frame is None:
+                    print("Получен сигнал завершения")
+                    break
+
+                if isinstance(frame, np.ndarray):
+                    if frame.shape[1] != combined_width or frame.shape[0] != combined_height:
+                        print(f"WARNING: Frame size mismatch! Expected {combined_width}x{combined_height}, got {frame.shape[1]}x{frame.shape[0]}")
+                    # Ресайзим если нужно
+                        frame = cv2.resize(frame, (combined_width, combined_height))
+
+                    frame_count += 1
+                    if frame_count % 30 == 0:
+                        print(f"Показано кадров: {frame_count}")
+
+                    cv2.imshow("Tracking", frame)
+
+                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    writer.append_data(frame_rgb)
+
+            except queue.Empty:
+                pass
+
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                print("\n Прервано пользователем (нажата 'q')")
+                running = False
+                break
+    finally:
+        print("Ожидание завершения потоков...")
+        running = False
+
+        if capture_thread.is_alive():
+            capture_thread.join(timeout=3)
+        if process_thread.is_alive():
+            process_thread.join(timeout=10)
+
+        print("Записываем оставшиеся кадры...")
+        remaining_count = 0
+        while not result_queue.empty():
+            try:
+                frame = result_queue.get_nowait()
+                if frame is not None and isinstance(frame, np.ndarray):
+                    if frame.shape[1] != combined_width or frame.shape[0] != combined_height:
+                        frame = cv2.resize(frame, (combined_width, combined_height))
+                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    writer.append_data(frame_rgb)
+                    frame_count += 1
+                    remaining_count += 1
+            except queue.Empty:
                 break
 
-            if isinstance(frame, np.ndarray):
-                frame_count += 1
-                if frame_count % 30 == 0:
-                    print(f"Показано кадров: {frame_count}")
-                cv2.imshow("Tracking", frame)
-                if out is not None:
-                    out.write(frame)
+        if remaining_count > 0:
+            print(f"  Записано ещё {remaining_count} кадров из очереди")
 
+        try:
+            writer.close()
 
-        except queue.Empty:
-             pass
+            print(f" Writer закрыт успешно")
+        except Exception as e:
+            print(f"ERROR при закрытии writer: {e}")
 
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord('q'):
-            print("\n Прервано пользователем (нажата 'q')")
-            running = False
-            if out is not None:
-                out.release()
-                print(f"Видео сохранено: output_track.avi ({frame_count} кадров)")
-            cv2.destroyAllWindows()
-            sys.exit(0)
+        cv2.destroyAllWindows()
 
-    print("Ожидание завершения потоков...")
-    running = False
+        # ИСПРАВЛЕНИЕ 6: Проверяем размер файла ПОСЛЕ закрытия
+        import os
+        if os.path.exists("output_track.mp4"):
+            file_size = os.path.getsize("output_track.mp4")
+            print(f" Видео сохранено: output_track.mp4")
+            print(f" Кадров: {frame_count}")
+            print(f" Размер файла: {file_size / (1024 * 1024):.2f} МБ")
+            if file_size == 0:
+                print("ВНИМАНИЕ: Файл пустой!")
+        else:
+            print("Файл output_track.mp4 не создан!")
 
-    capture_thread.join()
-    process_thread.join()
-
-    if out is not None:
-        out.release()
-        print(f"Видео сохранено: output_track.mp4 ({frame_count} кадров)")
-
-    cv2.destroyAllWindows()
-    print("Готово!")
+        print("Готово!")
 
 if __name__ == "__main__":
     main()
