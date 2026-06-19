@@ -7,15 +7,14 @@ import queue
 from sahi import AutoDetectionModel
 from sahi.predict import get_sliced_prediction
 from boxmot.trackers.ocsort.ocsort import OcSort
-import sys
 from heatmap import (
     HeatmapGenerator,
-    PerspectiveTransformer,
     create_default_transformer,
     create_heatmap_overlay,
     draw_heatmap_legend
 )
 import imageio
+import gc
 
 # TRACKER_CONFIG = "bytetrack.yaml"
 # TRACKER_CONFIG = "botsort.yaml"
@@ -31,13 +30,13 @@ MIN_ASPECT_RATIO = 0.25
 MAX_ASPECT_RATIO = 1.2
 MIN_CONFIDENCE = 0.25
 
-QUEUE_SIZE = 0
-DETECTION_INTERVAL = 5
+QUEUE_SIZE = 100
+DETECTION_INTERVAL = 4
 DSIZE=(1280,720)
 VIDEO_PATH = "md1.mp4"
 
-SLICE_HEIGHT = 480      # Высота каждого куска (тайла)
-SLICE_WIDTH = 480      # Ширина каждого куска
+SLICE_HEIGHT = 620      # Высота каждого куска (тайла)
+SLICE_WIDTH = 620      # Ширина каждого куска
 OVERLAP_RATIO = 0.25     # Перекрытие между кусками
 
 CONFIDENCE_THRESHOLD = 0.25 # уверенность(умен, если не находит)
@@ -56,6 +55,8 @@ running = True
 
 model_path = "yolov8s_openvino_model/"
 model = YOLO(model_path)
+# Быстрая модель для трекинга каждого кадра (без SAHI)
+fast_model = YOLO("yolov8n_openvino_model/")
 
 # SAHI модель для детекции
 sahi_model = AutoDetectionModel.from_pretrained(
@@ -68,10 +69,13 @@ sahi_model = AutoDetectionModel.from_pretrained(
 # BoxMOT трекер
 tracker = OcSort(
     det_thresh=0.1,      # Порог уверенности для детекций
-    max_age=20,           # Максимальный возраст трека в кадрах
+    max_age=300,           # Максимальный возраст трека в кадрах
     min_hits=1,           # Минимум детекций для подтверждения трека
-    iou_threshold=0.3,    # Порог IoU для связывания
-    obs_thresh=0.5,       # Порог уверенности для наблюдения
+    iou_threshold=0.5,    # Порог IoU для связывания
+    obs_thresh=0.3,       # Порог уверенности для наблюдения
+    delta_t=5,            # больше временное окно
+    inertia=0.4,          #больше инерция
+    use_byte=False,
     #track_thresh=0.1,     # Порог для уверенных треков
     #match_thresh=0.8,     # Порог для сопоставления
     #track_buffer=30,      # Буфер для потерянных треков
@@ -125,7 +129,12 @@ def capture_thread_func(path):
 
         frame = cv2.resize(src=frame, dsize=DSIZE, interpolation=cv2.INTER_NEAREST)
 
-        frame_queue.put((local_frame_counter, frame))
+        while running:
+            try:
+                frame_queue.put((local_frame_counter, frame), timeout=0.5)
+                break
+            except queue.Full:
+                continue
 
     cap.release()
     frame_queue.put(None)
@@ -136,7 +145,8 @@ def process_thread_func():
     global running, track_history, model, out
     process_counter = 0
     processed_counter = 0
-    last_tracks = [] #сохранение последних известных треков для отрисовки на промежуточных кадрах
+    tracks = []
+    last_tracks = []
 
     heatmap_gen = HeatmapGenerator(
         HEATMAP_WIDTH, HEATMAP_HEIGHT,
@@ -166,10 +176,34 @@ def process_thread_func():
             transformer = create_default_transformer(frame.shape, HEATMAP_WIDTH, HEATMAP_HEIGHT)
             print("Perspective transformer initialized")
 
+        detections = []
+        fast_result = fast_model(frame, conf=CONFIDENCE_THRESHOLD, verbose=False, imgsz=640)
+
+        for box in fast_result[0].boxes:
+            if box.cls[0] == 0:  # только люди
+                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                conf = float(box.conf[0].cpu().numpy())
+
+                width = x2 - x1
+                height = y2 - y1
+                area = width * height
+                aspect_ratio = width / max(height, 1)
+
+                if width < MIN_BOX_WIDTH or height < MIN_BOX_HEIGHT:
+                    continue
+                if area < MIN_BOX_AREA or area > MAX_BOX_AREA:
+                    continue
+                if aspect_ratio < MIN_ASPECT_RATIO or aspect_ratio > MAX_ASPECT_RATIO:
+                    continue
+                if conf < MIN_CONFIDENCE:
+                    continue
+
+                detections.append([x1, y1, x2, y2, conf, 0])
+
         if process_counter % DETECTION_INTERVAL == 1:
 
             enhanced_frame = enhance_frame(frame)
-             #трекинг на текущем кадре, с сохранением треков между кадрами
+            #трекинг на текущем кадре, с сохранением треков между кадрами
 
             result = get_sliced_prediction(
                 enhanced_frame,
@@ -183,7 +217,6 @@ def process_thread_func():
                 postprocess_match_threshold=0.3
             )
 
-            detections = []  ## перевод SAHI результат в формат для BoxMOT
             for obj in result.object_prediction_list:
                 if obj.category.name == 'person':
                     bbox = obj.bbox.to_xyxy()
@@ -203,39 +236,49 @@ def process_thread_func():
                     if obj.score.value < MIN_CONFIDENCE:
                         continue
 
-                    detections.append([
-                         bbox[0], bbox[1], bbox[2], bbox[3],
-                         obj.score.value,
-                         0  # класс айди для людей
-                    ])
+                    is_duplicate = False
+                    for det in detections:
+                        dx1, dy1, dx2, dy2 = det[:4]
+                        xi1 = max(x1, dx1)
+                        yi1 = max(y1, dy1)
+                        xi2 = min(x2, dx2)
+                        yi2 = min(y2, dy2)
+                        inter_area = max(0, xi2 - xi1) * max(0, yi2 - yi1)
+                        box_area = (x2 - x1) * (y2 - y1)
+                        det_area = (dx2 - dx1) * (dy2 - dy1)
+                        union_area = box_area + det_area - inter_area
+                        iou = inter_area / union_area if union_area > 0 else 0
+
+                        if iou > 0.5:  # Если IoU > 0.5, это тот же объект
+                            is_duplicate = True
+                            break
+
+                    if not is_duplicate:
+                        detections.append([x1, y1, x2, y2, obj.score.value, 0])
+
             #обновление трекера новыми детекциями
             if len(detections) > 0:
-                 tracks = tracker.update(np.array(detections), frame)
-                 print(f"Кадр {frame_idx}: найдено {len(detections)} человек, треков: {len(tracks)}")
+                tracks = tracker.update(np.array(detections), frame)
+                if process_counter % DETECTION_INTERVAL == 1:
+                    print(f"Кадр {frame_idx}: найдено {len(detections)}, треков: {len(tracks)}")
             else:
-                 tracks = tracker.update(np.empty((0, 6)), frame)
-                 print(f"Кадр {frame_idx}: людей не найдено")
+                tracks = tracker.update(np.empty((0, 6)), frame)
 
-            last_tracks = tracks
-
-            for track in tracks:
-                 x1, y1, x2, y2, track_id, conf, cls = track[:7]
-                 center_x = (x1 + x2) // 2
-                 center_y = (y1 + y2) // 2
-                 track_line = track_history[track_id]
-                 track_line.append((center_x, center_y))
-                 if len(track_line) > 30:
-                     track_line.pop(0)
-
-        else:
-            #просто использует сохраненные треки, чтобы они не исчезали
-            tracks = tracker.update(np.empty((0, 6)), frame)
-
+                #если трекер вернул пустой массив, используем последние известные треки
             if len(tracks) == 0 and len(last_tracks) > 0:
                 tracks = last_tracks
-            else:
+            elif len(tracks) > 0:
                 last_tracks = tracks
 
+        if len(tracks) > 0:
+            for track in tracks:
+                x1, y1, x2, y2, track_id, conf, cls = track[:7]
+                center_x = (x1 + x2) // 2
+                center_y = (y1 + y2) // 2
+                track_line = track_history[track_id]
+                track_line.append((center_x, center_y))
+                if len(track_line) > 30:
+                    track_line.pop(0)
 
         annotated_frame = frame.copy()
 
@@ -244,11 +287,13 @@ def process_thread_func():
             frame.shape, (HEATMAP_WIDTH, HEATMAP_HEIGHT)
         )
 
-        cv2.putText(heatmap_view, "HEATMAP - TOP VIEW", (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        cv2.putText(heatmap_view, "VIEW - Trajectories", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2)
         cv2.putText(heatmap_view, f"Tracks: {len(tracks)}", (10, 60),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-            #persons_found = 0
+        cv2.putText(heatmap_view, "HEATMAP - Density", (10, HEATMAP_HEIGHT + 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        #persons_found = 0
 
         if len(tracks) > 0:
             for track in tracks:
@@ -256,20 +301,21 @@ def process_thread_func():
                 x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
                 track_id = int(track_id)
 
-                    #цвет для каждого ID (уникальный)
+                #цвет для каждого ID (уникальный)
                 color = ((track_id * 50) % 255, (track_id * 100) % 255, (track_id * 150) % 255)
 
 
                 cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
                 cv2.putText(annotated_frame, f"ID:{track_id} ({conf:.2f})",
-                                (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-
+                            (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                '''
                 #рис траекторию
                 track_line = track_history[track_id]
                 if len(track_line) > 1:
                     points = np.array(track_line).astype(np.int32).reshape((-1, 1, 2))
                     cv2.polylines(annotated_frame, [points], isClosed=False,
                                   color=(230, 230, 230), thickness=3)
+                '''
 
         if process_counter % DETECTION_INTERVAL == 1:
             cv2.putText(annotated_frame, f"DETECTION (OpenVINO)",
@@ -279,13 +325,13 @@ def process_thread_func():
                         (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
         cv2.putText(annotated_frame, f"Frame: {frame_idx}",
-                        (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                    (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
         # + легенду heatmap
         draw_heatmap_legend(annotated_frame, position=(10, DSIZE[1] - 60))
 
         #объединение кадров
-        heatmap_resized = cv2.resize(heatmap_view, (DSIZE[0] // 2, DSIZE[1] // 2))
+        heatmap_resized = cv2.resize(heatmap_view, (DSIZE[0] // 2, DSIZE[1]))
 
         combined_frame = np.zeros((DSIZE[1], DSIZE[0] + DSIZE[0] // 2, 3), dtype=np.uint8)
         combined_frame[:DSIZE[1], :DSIZE[0]] = annotated_frame
@@ -300,6 +346,10 @@ def process_thread_func():
 
         if running:
             result_queue.put(combined_frame)
+
+            #принудительная очистка памяти каждые 10 кадров
+        if process_counter % 10 == 0:
+            gc.collect()
 
 
 def main():

@@ -4,7 +4,7 @@ from collections import deque
 
 class HeatmapGenerator:
 
-    def __init__(self, width=640, height=480, decay=0.95, radius=15):
+    def __init__(self, width=640, height=480, decay=0.999, radius=15):
         self.width = width
         self.height = height
         self.decay = decay
@@ -12,24 +12,50 @@ class HeatmapGenerator:
         self.heatmap = np.zeros((height, width), dtype=np.float32)
         self.points = []
         self.colors = []
+        self.track_trails = {}
+        self.all_time_points = []
+        self.max_all_points = 10000
+        # Матрица накопленной интенсивности (для нижней карты)
+        self.intensity_map = np.zeros((height, width), dtype=np.float32)
+        self.intensity_max = 1.0  #текущий максимум для нормализации
 
     def add_points(self, points_topdown):
         self.points = points_topdown
 
-        #новая heatmap для текущих точек
-        heatmap_new = np.zeros((self.height, self.width), dtype=np.float32)
-
+        #точки в постоянное хранилище верхней карты
         for x, y in points_topdown:
             if 0 <= x < self.width and 0 <= y < self.height:
-                cv2.circle(heatmap_new, (int(x), int(y)), self.radius, 1.0, -1)
+                self.all_time_points.append((int(x), int(y)))
 
-        #наложение с затуханием
-        self.heatmap = self.heatmap * self.decay + heatmap_new
-        self.heatmap = np.clip(self.heatmap, 0, 1)
+            #ограниченный размер хранилища
+        if len(self.all_time_points) > self.max_all_points:
+            self.all_time_points = self.all_time_points[-self.max_all_points:]
+
+            # Создаём маску текущих точе/нижняя карта
+        current_mask = np.zeros((self.height, self.width), dtype=np.float32)
+        for x, y in points_topdown:
+            if 0 <= x < self.width and 0 <= y < self.height:
+                cv2.circle(current_mask, (int(x), int(y)), self.radius, 1.0, -1)
+
+            # КЛЮЧЕВОЕ: Просто ДОБАВЛЯЕМ маску к интенсивности (без затухания!)
+        self.intensity_map += current_mask
+
+            # Обновляем максимум для нормализации
+        current_max = np.max(self.intensity_map)
+        if current_max > self.intensity_max:
+            self.intensity_max = current_max
+
+        self.heatmap = self.intensity_map / max(self.intensity_max, 1.0)
 
     def get_colored_heatmap(self):
-        heatmap_normalized = (self.heatmap * 255).astype(np.uint8)
-        heatmap_color = cv2.applyColorMap(heatmap_normalized, cv2.COLORMAP_JET)
+        #нормализация по текущему максимуму
+        if self.intensity_max > 0:
+            normalized = self.intensity_map / self.intensity_max
+        else:
+            normalized = self.intensity_map
+
+        heatmap_uint8 = (np.clip(normalized, 0, 1) * 255).astype(np.uint8)
+        heatmap_color = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
         return heatmap_color
 
     def get_points_overlay(self, color =(255,0,255), size =5):
@@ -48,6 +74,35 @@ class HeatmapGenerator:
         points_overlay = self.get_points_overlay()
         combined = cv2.addWeighted(heatmap_color, 1.0, points_overlay, alpha, 0)
         return combined
+
+    #разделённый вид: верх - точки+траектории, низ - тепловая карта
+    def get_split_view(self, point_color=(255, 0, 255), point_size=5, trail_thickness=2):
+        split_view = np.zeros((self.height * 2, self.width, 3), dtype=np.uint8)
+        #все точки
+        for x, y in self.all_time_points:
+            if 0 <= x < self.width and 0 <= y < self.height:
+                cv2.circle(split_view[:self.height], (x, y), point_size, point_color, -1)
+
+        for track_id, points_list in self.track_trails.items():
+            if len(points_list) > 1:
+                points_array = np.array(points_list, dtype=np.int32).reshape((-1, 1, 2))
+                # Все траектории одного цвета
+                cv2.polylines(split_view[:self.height], [points_array], isClosed=False,
+                              color=point_color, thickness=trail_thickness)
+
+        #текущие точки
+        for x, y in self.points:
+            if 0 <= x < self.width and 0 <= y < self.height:
+                cv2.circle(split_view[:self.height], (int(x), int(y)), point_size, point_color, -1)
+
+        #разделитель
+        cv2.line(split_view, (0, self.height), (self.width, self.height), (255, 255, 255), 2)
+
+        #Тепловая карта
+        heatmap_color = self.get_colored_heatmap()
+        split_view[self.height:, :] = heatmap_color
+
+        return split_view
 
     def reset(self):
         self.heatmap = np.zeros((self.height, self.width), dtype=np.float32)
@@ -111,31 +166,38 @@ def create_heatmap_overlay(heatmap_gen, transformer, tracks, track_history, fram
     #сбор точек из текущих треков
     if len(tracks) > 0:
         for track in tracks:
-            x1, y1, x2, y2, track_id = track[:5].astype(int)
-            track_id = int(track_id)
+            x1, y1, x2, y2 = track[:4].astype(int)
+            track_id = int(track[4])
 
             #точка контакта с полом (низ бокса)
             bottom_center = ((x1 + x2) // 2, y2)
 
             #добавлениев историю
             if track_id not in track_history:
-                track_history[track_id] = deque(maxlen=30)
-            track_history[track_id].append(bottom_center)
+                track_history[track_id] = []
+
+            track_line = track_history[track_id]
+            track_line.append(bottom_center)
+            if len(track_line) > 30:
+                track_line.pop(0)
 
             #трансформация  в вид сверху
             x_top, y_top = transformer.transform_point(bottom_center[0], bottom_center[1])
             current_points_topdown.append((x_top, y_top))
+            #для змейки
+            if track_id not in heatmap_gen.track_trails:
+                heatmap_gen.track_trails[track_id] = []
 
-            # + "хвост" из истории
-            for hist_point in list(track_history[track_id])[:-1]:
-                x_hist, y_hist = transformer.transform_point(hist_point[0], hist_point[1])
-                current_points_topdown.append((x_hist, y_hist))
+            trail = heatmap_gen.track_trails[track_id]
+            trail.append((x_top, y_top))
+            if len(trail) > 30:
+                trail.pop(0)
 
     # обновление heatmap
     heatmap_gen.add_points(current_points_topdown)
 
     # возврат комбинированного вид
-    return heatmap_gen.get_combined_view()
+    return heatmap_gen.get_split_view(point_color=(255, 0, 255), point_size=5, trail_thickness=2)
 
 #легенда
 def draw_heatmap_legend(frame, position=(10, 30)):
